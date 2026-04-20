@@ -1,0 +1,36 @@
+{
+  "name": "kwg_se_upload",
+  "skill": "kwg_se_upload",
+  "description": "Upload KWG search engine assignments to BrightEdge Mass Account KWG SE Upload",
+  "trigger": {
+    "zendesk_tag": "ai_agent_automation",
+    "subject_hint": "kwg se upload"
+  },
+  "inputs": {
+    "required": ["ticket_id", "username", "mappings"],
+    "optional": []
+  },
+  "input_sources": {
+    "ticket_id": "From webhook payload",
+    "username":  "Latest internal note containing 'BrightEdge Username'",
+    "mappings":  "Array of {identifier, account_id} pairs from credentials note — identifier is sheet name, filename, or null for single-account mode"
+  },
+  "outputs": {
+    "success": "Internal note posted confirming upload with KWG count per account",
+    "failure": "Internal note posted with error details and next steps for agent"
+  },
+  "edge_cases": [
+    "Multi-file: File: and Account ID labels required per file in credentials note",
+    "Multi-sheet Excel: Sheet: labels required per sheet",
+    "Single file with no labels: inferred automatically",
+    "SE IDs may be semicolon-separated in one cell or one per row — both handled",
+    "Upload timeout (10 min): note instructs agent to check BrightEdge manually"
+  ],
+  "supported_file_types": [".csv", ".tsv", ".xlsx", ".xls"],
+  "brightedge_upload_url": "/admin/mass_account_kwg_se_upload",
+  "tsv_format": "Login\\tKWG\\tSEs  (exact header — confirmed from sample file)",
+  "notes": [
+    "DOM IDs on KWG SE page assumed to match keyword upload page — verify on first run",
+    "Response format (Updated KWGs =>) unverified — update _parse_kwg_se_response after first live run"
+  ]
+}

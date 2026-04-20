@@ -1,0 +1,30 @@
+{
+  "name": "keyword_upload",
+  "skill": "keyword_upload",
+  "description": "Upload customer keyword file to BrightEdge Mass Account Keyword Upload",
+  "trigger": {
+    "zendesk_tag": "ai_agent_automation",
+    "subject_hint": "keyword upload"
+  },
+  "inputs": {
+    "required": ["ticket_id", "username", "mappings"],
+    "optional": []
+  },
+  "input_sources": {
+    "ticket_id": "From webhook payload",
+    "username":  "Latest internal note containing 'BrightEdge Username'",
+    "mappings":  "Array of {identifier, account_id} pairs from credentials note — identifier is sheet name, filename, or null for single-account mode"
+  },
+  "outputs": {
+    "success": "Internal note posted confirming upload with row counts per account",
+    "failure": "Internal note posted with error details and next steps for agent"
+  },
+  "edge_cases": [
+    "Multi-file: File: and Account ID labels required per file in credentials note",
+    "Multi-sheet Excel: Sheet: labels required per sheet",
+    "Single file with no labels: inferred automatically",
+    "Corrected re-upload: latest attachment comment always wins",
+    "Upload timeout (10 min): note instructs agent to check BrightEdge manually"
+  ],
+  "supported_file_types": [".csv", ".xlsx", ".xls"]
+}
