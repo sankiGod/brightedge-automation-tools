@@ -2,7 +2,14 @@
 
 ## What This Is
 
-A production AI agent that processes BrightEdge keyword upload requests from Zendesk automatically. An agent adds a single tag to a ticket; the system takes over — reads the ticket, downloads the keyword file, validates it, transforms it into BrightEdge's required TSV format, performs the upload via browser automation, and posts the result back to Microsoft Teams.
+A production AI agent that automates BrightEdge data management requests received via Zendesk. A support agent adds a single tag (`ai_agent_automation`) to a ticket; the system takes over — reads the ticket, identifies the request type, downloads the attached file, validates and transforms it into BrightEdge's required format, performs the upload via browser automation, and posts the result to Microsoft Teams with a summary and direct ticket link.
+
+Two skills are currently supported:
+
+- **Keyword Upload** — parses a customer CSV/Excel file, maps columns, transforms rows into BrightEdge's TSV format, and uploads via the Mass Account Keyword Upload admin UI
+- **KWG SE Upload** — assigns search engines to keyword groups by parsing an upload file and submitting it via the Mass Account KWG SE Upload admin UI
+
+Both skills handle single-account and multi-account tickets, support multi-file and multi-sheet workflows, and post actionable failure messages to Teams when something goes wrong.
 
 **Core principle: AI decides. Code executes. Validation protects.**
 
