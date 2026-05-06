@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A production AI agent that processes BrightEdge keyword upload requests from Zendesk automatically. An agent adds a single tag to a ticket; the system takes over — reads the ticket, downloads the keyword file, validates it, transforms it into BrightEdge's required TSV format, performs the upload via browser automation, and posts the result back to Zendesk and Microsoft Teams.
+A production AI agent that processes BrightEdge keyword upload requests from Zendesk automatically. An agent adds a single tag to a ticket; the system takes over — reads the ticket, downloads the keyword file, validates it, transforms it into BrightEdge's required TSV format, performs the upload via browser automation, and posts the result back to Microsoft Teams.
 
 **Core principle: AI decides. Code executes. Validation protects.**
 
@@ -12,7 +12,6 @@ A production AI agent that processes BrightEdge keyword upload requests from Zen
 
 ```
 webhook_receiver.py         FastAPI server — receives Zendesk webhooks, runs pipeline in background thread
-demo_runner.py              Manual test runner (no webhook required)
 
 core/
   orchestrator.py           Reasoning layer — reads ticket, selects skill, extracts inputs (3 modes)
@@ -23,21 +22,27 @@ core/
 skills/
   base.py                   Abstract Skill base class (name, description, input_schema, validate, execute)
   keyword_upload.py         Full end-to-end keyword upload skill implementation
+  kwg_se_upload.py          KWG search engine assignment upload skill
 
 tools/
   zendesk.py                Zendesk API — fetch ticket, post reply, download attachment, set status
   brightedge.py             Playwright browser automation — login, pod detection, upload, response parsing
+  brightedge_api.py         BrightEdge REST API client — keyword groups, KWG names, QA verification
   parser.py                 CSV/Excel parsing, column normalisation, fuzzy filename/sheet matching
   transformer.py            Column mapping (fuzzy → Claude fallback), row remapping, TSV generation, reply building
   column_reasoner.py        AI column mapping fallback (Cowork or Anthropic API)
   teams.py                  Microsoft Teams Adaptive Card notifications (3 card types)
-  attachment.py             Binary file download utility (MCP gap filler)
+  attachment.py             Binary file download utility (MCP gap filler); defines TMP_DIR and cleanup
 
 mcp/
   zendesk_server.py         Custom local MCP server wrapping tools/zendesk.py — used by Anthropic API path
 
 workflows/
   keyword_upload.json       Workflow definition — inputs, outputs, edge cases
+  kwg_se_upload.json        Workflow definition — inputs, outputs, edge cases
+
+tmp/                        Project-local temp directory — TSV uploads and downloaded attachments
+                            Files older than 10 days are deleted on server startup
 ```
 
 ---
@@ -49,11 +54,12 @@ Zendesk tag (ai_agent_automation) fires
   → POST /webhook/zendesk  (FastAPI — webhook_receiver.py)
       → dedup check (5-min window, keyed on ticket_id)
       → background thread: _run_and_clear(ticket_id)
-          → zd.fetch_ticket(ticket_id)         ← one API call, result passed into orchestrator
+          → cleanup_old_tmp_files()              ← runs on server startup, not per-ticket
+          → zd.fetch_ticket(ticket_id)           ← one API call, result passed into orchestrator
           → orchestrator.decide(ticket_id, registry, ticket=ticket_meta)
-              ├─ Mock mode (default)            rule-based regex, no AI
-              ├─ Cowork mode                    saves cowork_ticket.json, polls for cowork_decision.json
-              └─ Anthropic API mode (commented) Claude + Zendesk MCP sidecar
+              ├─ Mock mode (default)             rule-based regex, no AI
+              ├─ Cowork mode                     saves cowork_ticket.json, polls for cowork_decision.json
+              └─ Anthropic API mode (commented)  Claude + Zendesk MCP sidecar
           → decision["inputs"]["ticket_id"] = ticket_id   ← injected here, before validation
           → validator.validate(decision, skill)
           → skill.execute(inputs)
@@ -64,10 +70,12 @@ Zendesk tag (ai_agent_automation) fires
               → transformer.remap_rows + transform_to_groups
               → brightedge.fetch_account_logins (one browser session)
               → brightedge.upload_to_brightedge (per account — Playwright)
-          → transformer.build_reply(all_summaries, skipped_notes)  ← customer-facing
+          → transformer.build_reply(all_summaries, skipped_notes)   ← customer-facing
           → reporter.build_note(skill_name, inputs, result, elapsed) ← agent-facing
-          → teams.notify(ticket_id, assignee_email, customer_message, agent_note)
-              → set_status(ticket_id, "open")   ← always called inside teams.notify
+          → any_upload_failed = any(not s["success"] for s in all_summaries)
+          → teams.notify(ticket_id, assignee_email, customer_message, agent_note,
+                         failed=any_upload_failed)
+              → set_status(ticket_id, "open")    ← always called inside teams.notify
           → _processing.pop(ticket_id) in finally  ← clears dedup so ticket can be re-triggered
 ```
 
@@ -76,7 +84,7 @@ Zendesk tag (ai_agent_automation) fires
 - `TimeoutError` (Cowork or column reasoner did not respond within 5 min) → dedicated `except TimeoutError` → `teams.notify_error` with retry instructions
 - Missing fields from orchestrator → `teams.notify_missing_fields` with actionable bullet per field
 - Validation failure → `teams.notify_error`
-- Any other exception → `teams.notify_error` with raw error string
+- Any other exception → `teams.notify_error` with friendly message (JSONDecodeError, ConnectionError, and generic cases handled separately)
 
 ---
 
@@ -160,7 +168,7 @@ Both modes use the same system prompt instructing the model to return only JSON 
 
 ### Mode 2: Anthropic API (default when Cowork off)
 
-Calls `claude-sonnet-4-20250514` directly with headers + first 5 sample rows. Client is initialised lazily so a missing `ANTHROPIC_API_KEY` does not crash startup. Returns `None` on any API or parse error.
+Calls `claude-sonnet-4-6` directly with headers + first 5 sample rows. Client is initialised lazily so a missing `ANTHROPIC_API_KEY` does not crash startup. Returns `None` on any API or parse error.
 
 **Output shape (both modes):**
 ```json
@@ -203,9 +211,13 @@ Three public functions, all using Adaptive Card v1.2. Every function:
 - Uses `msteams.entities` to `@mention` the assignee by UPN, triggering a real Teams notification
 - Includes an `Action.OpenUrl` "View Ticket" button: `https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}`
 
-### `notify(ticket_id, assignee_email, customer_message, agent_note)`
+### `notify(ticket_id, assignee_email, customer_message, agent_note, failed=False)`
 
-Success/result card. `accent` (blue) header container. Renders `customer_message` then `agent_note` via `_message_to_blocks()`.
+Success/result card. Header style and title depend on the `failed` flag:
+- `failed=False` (default) → `accent` (blue) header, title: `"Keyword Upload — Ticket #X"`
+- `failed=True` → `attention` (red) header, title: `"Upload Failed — Ticket #X"`
+
+`failed=True` is passed when any account summary has `success=False`. Renders `customer_message` then `agent_note` via `_message_to_blocks()`.
 
 ### `notify_missing_fields(ticket_id, assignee_email, missing_fields)`
 
@@ -222,6 +234,16 @@ Converts plain text into Adaptive Card body elements:
 - A blank line flushes the FactSet buffer
 - Lines ending in `:` with no leading bullet → bold section header `TextBlock`
 - All other lines → regular `TextBlock`
+
+---
+
+## Temp File Management (`tools/attachment.py`)
+
+`TMP_DIR = Path(__file__).parent.parent / "tmp"` — all pipeline temp files go here:
+- TSV files written by `tools/brightedge.py` (`NamedTemporaryFile` with `dir=TMP_DIR`)
+- Attachment downloads from `tools/attachment.py`
+
+`cleanup_old_tmp_files(days=10)` deletes files in `TMP_DIR` older than `days` days. Called once at server startup in `webhook_receiver.py`'s `__main__` block.
 
 ---
 
@@ -266,7 +288,7 @@ Before alias matching, all headers are normalised:
 
 ---
 
-## TSV Output Format
+## TSV Output Format (Keyword Upload)
 
 ```
 Login\tKW\tPLP\toff\tKWG1\tKWG2\tKWG3...
@@ -280,9 +302,21 @@ Login\tKW\tPLP\toff\tKWG1\tKWG2\tKWG3...
 - Keywords in multiple groups appear on **one row** with each group in its own KWG column — not comma-separated in one cell
 - UTF-8 encoded
 
+## TSV Output Format (KWG SE Upload)
+
+```
+Login\tKWG\tSEs
+```
+
+- `Login` — account login email
+- `KWG` — keyword group name
+- `SEs` — comma-separated search engine IDs (e.g. `1,2,3`)
+- Header is exact: `login`, `kwg`, `ses` (confirmed from BrightEdge sample file)
+- UTF-8 encoded, no BOM
+
 ---
 
-## BrightEdge DOM Facts (CRITICAL)
+## BrightEdge DOM Facts — Keyword Upload (CRITICAL)
 
 The `hidden` attribute on `#massAccountUploadResponseHeader` is **never removed** by BrightEdge. Checking `element.hidden` always returns `true` even after upload completes.
 
@@ -299,6 +333,47 @@ The `hidden` attribute on `#massAccountUploadResponseHeader` is **never removed*
 Upload timeout: 600,000ms (10 minutes max).
 
 **Pod detection:** after login, BrightEdge redirects to `appN.brightedge.com`. All subsequent navigation uses this pod subdomain — never `www.brightedge.com`.
+
+**Login timeout:** `TIMEOUT_LOGIN = 60,000ms` (60 seconds). Increased from 30s because the login page can be slow to respond when called back-to-back with another browser session.
+
+---
+
+## BrightEdge DOM Facts — KWG SE Upload (CRITICAL)
+
+The KWG SE upload page behaves differently from keyword upload:
+
+**After clicking Next**, BrightEdge **navigates** to a new page:
+```
+/admin/mass_account_kwg_se_upload_import
+```
+
+Results render immediately on the `_import` page — there is no `#massAccountUploadResponseHeader` or `body.loading` phase.
+
+**Correct implementation** (`_upload_kwg_se_and_poll()` in `tools/brightedge.py`):
+```python
+page.click("#massAccountFileUploadNext", no_wait_after=True)
+page.wait_for_url("**/admin/mass_account_kwg_se_upload_import**", timeout=UPLOAD_TIMEOUT_MS)
+page_text = page.inner_text("body")
+return _parse_kwg_se_response(page_text)
+```
+
+**Response format** (confirmed from live run):
+```
+Account Specific - login@email.com :
+Congratulations => All Passed!
+```
+or on error:
+```
+Account Specific - login@email.com :
+Invalid Se Id Detected => "47"
+```
+
+`_parse_kwg_se_response()` extracts lines after the `"Account Specific"` sentinel, counts `Updated KWGs =>` lines for `kwgs_updated`, and collects any line containing `invalid`, `error`, `failed`, `not found`, or `detected` into `error_msgs`.
+
+**Invalid SE ID handling** in `tools/transformer.py`:
+- `_invalid_se_errors(summary)` — filters `error_msgs` for entries containing `"invalid se id"`
+- If all failed accounts have invalid SE errors, the Teams message is specific: explains the cause and instructs the user to correct their SE IDs and resubmit
+- A failed upload (`any_upload_failed=True`) sends a red (`attention`) Teams card via `teams.notify(failed=True)`
 
 ---
 
@@ -351,6 +426,10 @@ Account ID: 225
 3. **Dedicated `TimeoutError` handler.** `process_in_background()` has a specific `except TimeoutError` block before the generic `except Exception`. It posts a Teams card explaining that Cowork may not be running and gives clear retry instructions. The generic handler catches all other exceptions separately.
 
 4. **`missing_fields` strings are human-readable and actionable.** Both the mock orchestrator and the future Claude orchestrator populate `missing_fields` with complete, agent-readable instructions (e.g. `"BrightEdge Username not found. Add a line: 'BrightEdge Username: your@email.com'"`). These strings are rendered directly as bullet points in Teams cards without any further formatting.
+
+5. **Failed upload routing.** `webhook_receiver.py` computes `any_upload_failed = any(not s.get("success") for s in all_summaries)` and passes `failed=any_upload_failed` to `teams.notify()`. This switches the card header to red and the title to "Upload Failed".
+
+6. **`error_msgs` passed through.** `upload_kwg_se_to_brightedge()` includes `"error_msgs": upload_result.get("error_msgs", [])` in its return dict so `transformer.build_kwg_se_reply()` can detect specific failure types (e.g. invalid SE IDs).
 
 ---
 
@@ -435,20 +514,23 @@ class Skill:
 
 ### Working end-to-end
 
-- Full WAT pipeline: webhook → orchestrator → validator → skill → reporter → Teams + Zendesk
+- Full WAT pipeline: webhook → orchestrator → validator → skill → reporter → Teams
 - Mock orchestrator (rule-based, no API): single-file and multi-file CSV, regex extraction
 - Cowork orchestrator mode: file handoff with pre-filled mapping template and `_instructions` block
 - Cowork column reasoner mode: file handoff with headers, sample rows, and system prompt
-- Anthropic API column reasoner: calls `claude-sonnet-4-20250514` directly (requires `ANTHROPIC_API_KEY`)
+- Anthropic API column reasoner: calls `claude-sonnet-4-6` directly (requires `ANTHROPIC_API_KEY`)
 - File parsing: CSV (UTF-8 BOM handling), Excel (all sheets, header row auto-detection)
 - Column mapping: fuzzy alias matching → Claude fallback pipeline
 - TSV transformation: multi-group deduplication, dynamic KWG column count, account-scoped login lookup
-- BrightEdge Playwright: login, cookie banner handling, pod detection, account switch, upload, response parsing, logout
+- BrightEdge Playwright — keyword upload: login, cookie banner, pod detection, account switch, upload, DOM response parsing, logout
+- BrightEdge Playwright — KWG SE upload: login, account switch, TSV upload, `wait_for_url` navigation to `_import` page, response parsing, logout
+- Invalid SE ID detection: specific Teams card message with actionable fix instructions
 - Account login lookup: `fetch_account_logins()` scrapes manage_account admin table with DataTables pagination
-- Teams Adaptive Cards: success, missing-fields, and error card types; `@mention` via `msteams.entities`
+- Teams Adaptive Cards: success (blue), upload failure (red), missing-fields, and error card types; `@mention` via `msteams.entities`; `failed=` flag routes to red/blue header automatically
 - Zendesk: fetch ticket (credential/file scoping), post public reply and internal note, set status
 - Loop prevention: tag removal (primary) + 5-min dedup window with `finally` clear (secondary)
 - `TimeoutError` separated from generic exceptions for clean Teams messaging
+- Temp file management: all TSVs and downloads go to `tmp/`; files older than 10 days cleaned on startup
 - `ticket_id` injection before validation
 - Ticket pre-fetched once and passed into orchestrator (no double API call)
 
@@ -456,7 +538,7 @@ class Skill:
 
 - **Anthropic API orchestrator** — commented out in `core/orchestrator.py` pending API credits. Code is complete; uncomment the `client.beta.messages.create` block and remove the `_decide_mock()` call.
 - **Anthropic API reporter** — commented out in `core/reporter.py` pending API credits. Rule-based mock active. Uncomment the `client.messages.create` block to restore AI-generated summaries.
-- **Stuck upload condition** — DOM state when BrightEdge hangs mid-upload is unknown. Retry logic cannot be written until DevTools inspection during a live stuck upload identifies the signal. The `TODO` comment is in `brightedge.py → _upload_and_poll()`.
+- **Stuck upload condition** — DOM state when BrightEdge hangs mid-upload is unknown. Retry logic cannot be written until DevTools inspection during a live stuck upload identifies the signal.
 - **Multi-sheet Excel end-to-end** — code path exists and is exercised, but has not been tested with a real multi-sheet Excel ticket.
 - **Celery + Redis** — webhook currently runs synchronously in a background thread (one ticket at a time per process). `REDIS_URL` is reserved for the future async task queue.
-- **Teams confirm/reject card for column mapping** — `notify_missing_fields` exists but interactive Confirm/Reject buttons for agent review of ambiguous column mappings are not yet built. Column reasoner currently proceeds automatically and logs a skip note if it cannot resolve.
+- **Teams confirm/reject card for column mapping** — interactive Confirm/Reject buttons for agent review of ambiguous column mappings are not yet built. Column reasoner currently proceeds automatically and logs a skip note if it cannot resolve.
